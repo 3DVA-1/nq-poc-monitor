@@ -181,6 +181,40 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(accepted, [event()["id"]])
             self.assertEqual(monitor.load_state(path)["pending"], [])
 
+    def test_smtp_authentication_and_message_follow_verified_starttls(self):
+        credentials = ("sender@example.com", "dummy-app-password", "recipient@example.com")
+        with patch.object(monitor, "mail_settings", return_value=credentials), \
+             patch.object(monitor.smtplib, "SMTP") as connect:
+            smtp = connect.return_value.__enter__.return_value
+            smtp.send_message.return_value = {}
+            monitor.send_mail("Test subject", "Test body", "test-secure-mail")
+            connect.assert_called_once_with("smtp.gmail.com", 587, timeout=30)
+            self.assertEqual([call[0] for call in smtp.method_calls],
+                             ["ehlo", "starttls", "ehlo", "login", "send_message"])
+            context = smtp.starttls.call_args.kwargs["context"]
+            self.assertTrue(context.check_hostname)
+            self.assertEqual(context.verify_mode, monitor.ssl.CERT_REQUIRED)
+            smtp.login.assert_called_once_with(credentials[0], credentials[1])
+            smtp.send_message.assert_called_once()
+            message = smtp.send_message.call_args.args[0]
+            self.assertEqual(message["To"], credentials[2])
+
+    def test_smtp_never_authenticates_or_sends_if_starttls_fails(self):
+        failures = (smtplib.SMTPNotSupportedError("STARTTLS unavailable"),
+                    monitor.ssl.SSLError("TLS handshake failed"))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), \
+                 patch.object(monitor, "mail_settings", return_value=("sender@example.com", "dummy-app-password", "recipient@example.com")), \
+                 patch.object(monitor.smtplib, "SMTP") as connect:
+                smtp = connect.return_value.__enter__.return_value
+                smtp.starttls.side_effect = failure
+                with self.assertRaises(type(failure)):
+                    monitor.send_mail("Test subject", "Test body", "test-no-plaintext")
+                smtp.starttls.assert_called_once()
+                smtp.login.assert_not_called()
+                smtp.send_message.assert_not_called()
+                self.assertEqual(smtp.ehlo.call_count, 1)
+
     def test_expired_outbox_event_discarded_without_smtp(self):
         state = monitor.new_state()
         state["pending"] = [event()]
@@ -223,7 +257,8 @@ class MonitorTests(unittest.TestCase):
             with patch.object(monitor, "fetch_chart", return_value=chart_data(items)), \
                  patch.object(monitor, "mail_settings", return_value=("a@b.c", "fake", "a@b.c")), \
                  patch.object(monitor.time, "time", return_value=now), \
-                 patch.object(monitor.smtplib, "SMTP_SSL", side_effect=AssertionError("mail on reset")):
+                 patch.object(monitor, "send_mail", side_effect=AssertionError("mail on reset")), \
+                 patch.object(monitor.smtplib, "SMTP", side_effect=AssertionError("SMTP on reset")):
                 result = monitor.main(["--config", str(cfg_path), "--state-dir", directory, "--reset-state"])
             self.assertEqual(result, 0)
             self.assertEqual(monitor.load_state(state_path)["last_bar"], items[-1][0])
