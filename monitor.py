@@ -212,8 +212,14 @@ def send_mail(subject, body, event_id):
     msg["Date"] = formatdate(localtime=False)
     msg["Message-ID"] = f"<nq-{event_id}@nq-monitor.local>"
     msg.set_content(body)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30, context=ssl.create_default_context()) as smtp:
+    LOG.info("Connecting to Gmail SMTP using STARTTLS")
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+        smtp.ehlo()
+        smtp.starttls(context=ssl.create_default_context())
+        smtp.ehlo()
+        LOG.info("Gmail TLS established; authenticating")
         smtp.login(username, password)
+        LOG.info("Gmail authenticated; submitting email")
         refused = smtp.send_message(msg)
         if refused:
             raise RuntimeError("SMTP recipient rejected")
