@@ -44,9 +44,11 @@ Jeigu `ALERT_EMAIL` nepateiksi, laiškai siunčiami į `GMAIL_USER`.
 
 ### 4. Patikrink ir aktyvuok
 
+Pasirenkamas duomenų patikrinimas prieš įrašant „Gmail“ programos slaptažodį: „Actions → NQ POC el. pastas → Run workflow“ pažymėk **Patikrinti duomenis be laisku ir be pazangos issaugojimo**. Šis bandymas gauna NQ žvakes ir parodo POC, nereikalauja „Gmail“ prisijungimo, nesiunčia laiškų ir neišsaugo pažangos. Jei pažymėtos abi bandymo parinktys, pirmenybė teikiama duomenų patikrinimui ir laiškas nesiunčiamas. Tikram stebėjimui šią parinktį išjunk.
+
 1. „Actions“ pasirink **NQ POC el. pastas → Run workflow**.
 2. Pažymėk **Siusti tik bandomaji laiska** ir paleisk. Patikrink Gmail, įskaitant šlamšto aplanką. Tai tik bandomasis laiškas.
-3. Dar kartą paleisk tą pačią darbo eigą, šį kartą be bandomojo laiško žymos. Pirmas rinkos patikrinimas sukurs `state/` pažangos failą.
+3. Dar kartą paleisk tą pačią darbo eigą, šį kartą išjungęs abi bandymo parinktis. Pirmas rinkos patikrinimas sukurs `state/` pažangos failą.
 4. Žurnale turi būti „First run: baseline recorded“ ir baigtų žvakių bei POC reikšmės. „GitHub“ turi įrašyti „Save NQ monitoring progress“ pakeitimą.
 5. Po to grafikas vykdomas automatiškai 7, 22, 37 ir 52 minutę kiekvieną valandą (UTC). Kompiuterį gali išjungti.
 6. Žalia „Actions“ būsena patvirtina vykdymą, bet ne rinkos duomenų šviežumą. Žurnale visada matysi naujausios apdorotos žvakės laiką. Uždarytoje rinkoje jis natūraliai senesnis.
