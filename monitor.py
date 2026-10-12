@@ -1,0 +1,302 @@
+"""Delayed NQ POC alerts, using 15-minute Yahoo Finance OHLCV and Gmail SMTP.
+
+Run once from a scheduler. The state directory must survive across runs.
+No trading/account endpoints are used. Yahoo's public chart endpoint is not
+a guaranteed service; bar confirmation uses a configurable delay heuristic.
+"""
+import argparse
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import smtplib
+import ssl
+import sys
+import time
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from email.utils import formatdate
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
+
+from volume_profile import Bar, profile, crossing
+
+INTERVAL = 900
+ROOT = Path(__file__).resolve().parent
+LOG = logging.getLogger("nq")
+
+
+def read_config(path):
+    cfg = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(cfg.get("symbol"), str) or not cfg["symbol"]:
+        raise ValueError("config.json: symbol is required")
+    for key, lo, hi in (("bars", 1, 500), ("rows", 5, 100),
+                        ("assumed_delay_seconds", 0, 3600),
+                        ("finalization_buffer_seconds", 0, 3600),
+                        ("maximum_alert_age_seconds", 1800, 86400)):
+        value = cfg.get(key)
+        if type(value) is not int or not lo <= value <= hi:
+            raise ValueError(f"config.json: invalid {key}")
+    percent = cfg.get("value_area_percent")
+    if type(percent) not in (int, float) or not 0 <= percent <= 100:
+        raise ValueError("config.json: invalid value_area_percent")
+    for key in ("alert_up", "alert_down"):
+        if type(cfg.get(key)) is not bool:
+            raise ValueError(f"config.json: invalid {key}")
+    ZoneInfo(cfg["display_timezone"])
+    return cfg
+
+
+def identity(cfg):
+    relevant = {k: cfg[k] for k in ("symbol", "bars", "rows", "value_area_percent", "alert_up", "alert_down")}
+    relevant["calculation_version"] = 1
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def fetch_chart(symbol):
+    query = urlencode({"range": "1mo", "interval": "15m", "includePrePost": "true"})
+    last_error = None
+    # The second hostname is a fallback for service outages, not rate limits.
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{quote(symbol, safe='')}?{query}"
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=25) as response:
+                payload = json.load(response)
+            chart = payload.get("chart", {})
+            if chart.get("error") or not chart.get("result"):
+                raise ValueError("Data provider did not return a chart")
+            return chart["result"][0]
+        except HTTPError as exc:
+            if exc.code == 429:
+                raise RuntimeError("Yahoo rate limit (429); retry on next scheduled run") from exc
+            last_error = exc
+        except (URLError, TimeoutError, ValueError) as exc:
+            last_error = exc
+    raise RuntimeError("Yahoo chart request failed") from last_error
+
+
+def parse_candles(chart):
+    if chart.get("meta", {}).get("dataGranularity") != "15m":
+        raise ValueError("Provider returned a different candle interval")
+    timestamps = chart.get("timestamp", [])
+    quotes = chart.get("indicators", {}).get("quote", [])
+    if not timestamps or not quotes:
+        raise ValueError("Provider returned no OHLCV candles")
+    fields = ("open", "high", "low", "close", "volume")
+    q = quotes[0]
+    if any(len(q.get(field, [])) != len(timestamps) for field in fields):
+        raise ValueError("Provider returned mismatched OHLCV arrays")
+    candles = []
+    seen = set()
+    for i, stamp in enumerate(timestamps):
+        if type(stamp) is not int or stamp in seen:
+            raise ValueError("Invalid or duplicate candle timestamp")
+        seen.add(stamp)
+        values = [q[field][i] for field in fields]
+        if all(value is None for value in values):
+            continue  # Provider's explicit no-trading row.
+        # Keep invalid partial bars in sequence so no profile bridges past them.
+        bar = None
+        if all(value is not None for value in values):
+            try:
+                candidate = Bar(*(float(value) for value in values))
+                candidate.validate()
+                bar = candidate
+            except (ValueError, TypeError):
+                pass
+        candles.append((stamp, bar))
+    return sorted(candles)
+
+
+def finalized(candles, cfg, now):
+    cutoff = now - cfg["assumed_delay_seconds"] - cfg["finalization_buffer_seconds"]
+    return [(stamp, bar) for stamp, bar in candles if stamp + INTERVAL <= cutoff]
+
+
+def poc_at(candles, index, cfg):
+    count = cfg["bars"]
+    if index < count - 1:
+        return None
+    bars = [bar for _, bar in candles[index - count + 1:index + 1]]
+    if any(bar is None for bar in bars):
+        return None
+    return profile(bars, cfg["rows"], cfg["value_area_percent"])
+
+
+def new_state():
+    return {"version": 1, "last_bar": None, "pending": [], "contract_hint": None}
+
+
+def load_state(path):
+    if not path.exists():
+        return new_state()
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("version") != 1 or not isinstance(state.get("pending"), list):
+        raise ValueError("Invalid state file; preserve it and inspect before resetting")
+    return state
+
+
+def save_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def process(candles, cfg, now, state, contract_hint=None):
+    if len(candles) < cfg["bars"] + 1:
+        raise ValueError("Not enough finalized candles for current and previous POC")
+    # Names are merely a best-effort contract-change hint, not a rollover guarantee.
+    if contract_hint and state.get("contract_hint") and contract_hint != state["contract_hint"]:
+        LOG.warning("Contract description changed; resetting signal baseline")
+        state.update(last_bar=None, pending=[])
+    if contract_hint:
+        state["contract_hint"] = contract_hint
+    latest = candles[-1][0]
+    if state["last_bar"] is None:
+        state["last_bar"] = latest
+        LOG.info("First run: baseline recorded; historical alerts suppressed")
+        return
+    if latest < state["last_bar"]:
+        raise ValueError("Provider data is older than the saved checkpoint")
+    unseen = [(i, stamp) for i, (stamp, _) in enumerate(candles) if stamp > state["last_bar"]]
+    if unseen and unseen[0][0] < cfg["bars"]:
+        LOG.warning("Data gap exceeds available history; resetting baseline")
+        state["last_bar"] = latest
+        return
+    for index, stamp in unseen:
+        current = poc_at(candles, index, cfg)
+        previous = poc_at(candles, index - 1, cfg)
+        if current is None or previous is None:
+            LOG.warning("Skipping candle %s: undefined profile or invalid OHLCV", stamp)
+        else:
+            direction = crossing(candles[index - 1][1].close, previous["poc"], candles[index][1].close, current["poc"])
+            enabled = cfg["alert_up"] if direction == "up" else cfg["alert_down"]
+            if direction and enabled:
+                if now - (stamp + INTERVAL) <= cfg["maximum_alert_age_seconds"]:
+                    event_id = f"{identity(cfg)}-{stamp}-{direction}"
+                    if not any(item["id"] == event_id for item in state["pending"]):
+                        state["pending"].append({"id": event_id, "bar_open": stamp,
+                                                 "direction": direction,
+                                                 "close": candles[index][1].close,
+                                                 "poc": current["poc"],
+                                                 "previous_close": candles[index - 1][1].close,
+                                                 "previous_poc": previous["poc"]})
+                        LOG.info("Queued delayed POC signal: %s", direction)
+                else:
+                    LOG.info("Old recovery signal skipped")
+        state["last_bar"] = stamp
+
+
+def mail_settings():
+    username = os.getenv("GMAIL_USER", "").strip()
+    password = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+    recipient = os.getenv("ALERT_EMAIL", "").strip() or username
+    if not username or not password or "@" not in recipient or "@" not in username:
+        raise ValueError("Set GMAIL_USER, GMAIL_APP_PASSWORD and optionally ALERT_EMAIL")
+    if any(ch in username + recipient for ch in "\r\n"):
+        raise ValueError("Invalid email address")
+    return username, password, recipient
+
+
+def send_mail(subject, body, event_id):
+    username, password, recipient = mail_settings()
+    msg = EmailMessage()
+    msg["From"] = username
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=False)
+    msg["Message-ID"] = f"<nq-{event_id}@nq-monitor.local>"
+    msg.set_content(body)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30, context=ssl.create_default_context()) as smtp:
+        smtp.login(username, password)
+        refused = smtp.send_message(msg)
+        if refused:
+            raise RuntimeError("SMTP recipient rejected")
+
+
+def describe_event(event, cfg, now):
+    zone = ZoneInfo(cfg["display_timezone"])
+    closed = datetime.fromtimestamp(event["bar_open"] + INTERVAL, timezone.utc).astimezone(zone)
+    direction = "Kaina virš POC" if event["direction"] == "up" else "Kaina žemiau POC"
+    age = max(0, int((now - event["bar_open"] - INTERVAL) / 60))
+    subject = f"[VĖLUOJANTYS DUOMENYS] {cfg['symbol']} 15 min — {direction}"
+    body = (f"{direction}\n\nSimbolis: {cfg['symbol']} (Yahoo Finance)\n"
+            f"Žvakės užsidarymas: {closed:%Y-%m-%d %H:%M %Z} ({cfg['display_timezone']})\n"
+            f"Užsidarymo kaina: {event['close']:.2f}\nPOC: {event['poc']:.4f}\n"
+            f"Ankstesnis užsidarymas / POC: {event['previous_close']:.2f} / {event['previous_poc']:.4f}\n"
+            f"Praėjo nuo žvakės pabaigos: apie {age} min.\n"
+            f"Profilis: {cfg['bars']} žvakių, {cfg['rows']} eilučių, VA {cfg['value_area_percent']} %.\n\n"
+            "Tai vėluojančių duomenų signalas. POC perskaičiuojamas, todėl pusės pasikeitimą "
+            "gali sukelti ir linijos judėjimas. Yahoo NQ=F duomenys gali skirtis nuo "
+            "TradingView pasirinkto kontrakto ir sesijos.\n")
+    return subject, body
+
+
+def deliver_pending(state, path, cfg, now, sender=send_mail):
+    while state["pending"]:
+        event = state["pending"][0]
+        if now - event["bar_open"] - INTERVAL > cfg["maximum_alert_age_seconds"]:
+            LOG.warning("Expired pending signal discarded")
+        else:
+            subject, body = describe_event(event, cfg, now)
+            sender(subject, body, event["id"])
+            LOG.info("Signal accepted by SMTP server")
+        state["pending"].pop(0)
+        save_state(path, state)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=str(ROOT / "config.json"))
+    parser.add_argument("--state-dir", default=str(ROOT / "state"))
+    parser.add_argument("--once", action="store_true", help="One scheduled check (default)")
+    parser.add_argument("--dry-run", action="store_true", help="Inspect data; no mail and no state changes")
+    parser.add_argument("--test-email", action="store_true", help="Send an explicit test email only")
+    parser.add_argument("--reset-state", action="store_true", help="Reset this configuration's baseline; discard pending alerts")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    try:
+        cfg = read_config(args.config)
+        if args.test_email:
+            if args.dry_run:
+                raise ValueError("Do not combine --test-email with --dry-run")
+            send_mail("NQ stebėtojas — bandomasis laiškas", "Laiškų siuntimas veikia. Tai bandymas, ne rinkos signalas.", f"test-{int(time.time())}")
+            LOG.info("Test email accepted by SMTP server")
+            return 0
+        if not args.dry_run:
+            mail_settings()  # Do not start monitoring with incomplete email setup.
+        path = Path(args.state_dir) / f"{identity(cfg)}.json"
+        state = new_state() if args.reset_state else load_state(path)
+        chart = fetch_chart(cfg["symbol"])
+        now = time.time()
+        candles = finalized(parse_candles(chart), cfg, now)
+        process(candles, cfg, now, state, chart.get("meta", {}).get("shortName"))
+        current = poc_at(candles, len(candles) - 1, cfg)
+        latest_time = datetime.fromtimestamp(candles[-1][0] + INTERVAL, timezone.utc).isoformat()
+        LOG.info("Finalized candles: %d; latest close time UTC: %s", len(candles), latest_time)
+        if current:
+            LOG.info("Close: %.2f; POC: %.4f; VA: %.4f .. %.4f", candles[-1][1].close, current["poc"], current["val"], current["vah"])
+        if args.dry_run:
+            LOG.info("Dry run: %d pending signals; nothing sent or saved", len(state["pending"]))
+            return 0
+        save_state(path, state)  # Durable outbox before attempting SMTP.
+        deliver_pending(state, path, cfg, now)
+        return 0
+    except (ValueError, KeyError, IndexError) as exc:
+        LOG.error("Setup or data error: %s", exc)
+    except smtplib.SMTPAuthenticationError:
+        LOG.error("Gmail rejected login; check app password and 2-Step Verification")
+    except smtplib.SMTPException:
+        LOG.error("SMTP failed; pending signal retained for a later retry")
+    except (OSError, RuntimeError) as exc:
+        LOG.error("Service error (%s): %s", type(exc).__name__, exc)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

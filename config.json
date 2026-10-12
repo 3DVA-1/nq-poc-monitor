@@ -1,0 +1,12 @@
+{
+  "symbol": "NQ=F",
+  "bars": 150,
+  "rows": 24,
+  "value_area_percent": 70,
+  "alert_up": true,
+  "alert_down": true,
+  "assumed_delay_seconds": 900,
+  "finalization_buffer_seconds": 60,
+  "maximum_alert_age_seconds": 5400,
+  "display_timezone": "Europe/Vilnius"
+}
