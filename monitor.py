@@ -291,8 +291,14 @@ def main(argv=None):
         LOG.error("Setup or data error: %s", exc)
     except smtplib.SMTPAuthenticationError:
         LOG.error("Gmail rejected login; check app password and 2-Step Verification")
-    except smtplib.SMTPException:
-        LOG.error("SMTP failed; pending signal retained for a later retry")
+    except smtplib.SMTPException as exc:
+        # Record only the exception type and numeric codes, never server text or credentials.
+        code = getattr(exc, "smtp_code", None)
+        codes = {code} if isinstance(code, int) else set()
+        if isinstance(exc, smtplib.SMTPRecipientsRefused):
+            codes.update(reply[0] for reply in exc.recipients.values() if isinstance(reply[0], int))
+        LOG.error("SMTP failed (%s; response codes: %s); pending signal retained for a later retry",
+                  type(exc).__name__, ",".join(str(code) for code in sorted(codes)) or "not provided")
     except (OSError, RuntimeError) as exc:
         LOG.error("Service error (%s): %s", type(exc).__name__, exc)
     return 1
