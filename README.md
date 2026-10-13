@@ -1,15 +1,17 @@
 # NQ stebėtojas — tavo POC indikatorius ir Gmail laiškai
 
-Programa gauna vėluojančias NQ 15 min. žvakes iš „Yahoo Finance“, perskaičiuoja tavo „Volume Profile / Fixed Range“ ir siunčia laišką, kai kaina pakeičia pusę POC linijos atžvilgiu. Pradiniai nustatymai tokie patys: **150 žvakių, 24 eilutės, 70 % Value Area**. Tai nėra visa prekybos ar grafiko platforma; indikatoriaus skaičiavimas naudojamas perspėjimui.
+Programa gauna vėluojančias NQ **15 min. ir 1H** žvakes iš „Yahoo Finance“, kiekvienam intervalui atskirai perskaičiuoja tavo „Volume Profile / Fixed Range“ ir siunčia laišką, kai kaina pakeičia pusę POC linijos atžvilgiu. Abiem intervalams naudojami tavo nustatymai: **150 žvakių, 24 eilutės, 70 % Value Area**. 1H profilis skaičiuojamas iš 150 valandinių žvakių, o 15 min. profilis — iš 150 penkiolikos minučių žvakių. Laiško temoje ir tekste nurodomas signalo intervalas.
+
+`config.json` laukelis `"timeframes": ["15m", "1h"]` įjungia abu intervalus. Galima palikti tik vieną iš jų. Senesnė konfigūracija be šio laukelio stebi tik 15 min. grafiką.
 
 ## Kada ateina laiškas
 
 - Į viršų: ankstesnis užsidarymas buvo ties ankstesniu POC arba žemiau; naujas užsidarymas yra virš naujo POC.
 - Į žemyn: ankstesnis užsidarymas buvo ties ankstesniu POC arba aukščiau; naujas užsidarymas yra žemiau naujo POC.
 - POC perskaičiuojamas, todėl signalą gali sukelti ir pačios linijos judėjimas.
-- Tikrinamos baigtos 15 min. žvakės pagal laiko taisyklę: „Yahoo“ [CME kotiruotėms nurodo 10 min. vėlavimą](https://help.yahoo.com/kb/yahoo-finance-plus/partnerships-sln2310.html), todėl laukiama bent **10 min. po žvakės pabaigos ir dar 1 min. atsargos**. Tiekėjas neduoda patikimo „galutinė žvakė“ žymeklio, todėl tai laiko prielaida, o ne garantija, kad šaltinis nepatikslins duomenų.
-- Debesijos patikrinimas suplanuotas kas 15 min., 12, 27, 42 ir 57 minutę kiekvieną valandą (UTC), apie **12 min. po įprastos 15 min. žvakės pabaigos**. Gavus signalą, tada bandoma siųsti laišką. „GitHub“ vykdymas gali papildomai vėluoti arba būti praleistas, o duomenų šaltinis gali atnaujinti ar patikslinti žvakes vėliau.
-- Pirmas paleidimas įsimena dabartinę padėtį ir nesiunčia senų signalų. Naujos konfigūracijos taip pat pradedamos be istorinių laiškų.
+- Tikrinamos tik užsidariusios kiekvieno intervalo žvakės pagal laiko taisyklę: „Yahoo“ [CME kotiruotėms nurodo 10 min. vėlavimą](https://help.yahoo.com/kb/yahoo-finance-plus/partnerships-sln2310.html), todėl laukiama bent **10 min. po žvakės pabaigos ir dar 1 min. atsargos**. 1H žvakė vertinama tik pasibaigus visai jos valandai. Tiekėjas neduoda patikimo „galutinė žvakė“ žymeklio, todėl tai laiko prielaida, o ne garantija, kad šaltinis nepatikslins duomenų.
+- Abiejų intervalų patikrinimas suplanuotas kas 15 min., 12, 27, 42 ir 57 minutę kiekvieną valandą (UTC), apie **12 min. po įprastos 15 min. arba 1H žvakės pabaigos**. Gavus signalą, tada bandoma siųsti laišką. „GitHub“ vykdymas gali papildomai vėluoti arba būti praleistas, o duomenų šaltinis gali atnaujinti ar patikslinti žvakes vėliau.
+- Kiekvienas intervalas turi atskirą pažangą ir laukiančius laiškus. Pirmas jo paleidimas įsimena dabartinę padėtį ir nesiunčia senų signalų. Pridėjus 1H, esama 15 min. pažanga išlaikoma; tik naujasis 1H intervalas pradeda nuo dabartinės vietos. Nauji profilio nustatymai taip pat pradedami be istorinių laiškų.
 - Po sutrikimo aptinkami neperskaityti signalai, bet senesni nei 90 min. nebesiunčiami.
 - SMTP klaidos atveju signalas išsaugomas ir bandomas vėliau. Pakartotinis siuntimas vykdomas, kai pavyksta ir rinkos duomenų užklausa; ilgas duomenų sutrikimas gali atidėti laišką iki jo galiojimo pabaigos. Po neaiškaus ryšio nutrūkimo retai galimas pakartotinis laiškas, nes SMTP negali užtikrinti vienintelio pristatymo.
 
@@ -48,8 +50,8 @@ Pasirenkamas duomenų patikrinimas prieš įrašant „Gmail“ programos slapta
 
 1. „Actions“ pasirink **NQ POC el. pastas → Run workflow**.
 2. Pažymėk **Siusti tik bandomaji laiska** ir paleisk. Patikrink Gmail, įskaitant šlamšto aplanką. Tai tik bandomasis laiškas.
-3. Dar kartą paleisk tą pačią darbo eigą, šį kartą išjungęs abi bandymo parinktis. Pirmas rinkos patikrinimas sukurs `state/` pažangos failą.
-4. Žurnale turi būti „First run: baseline recorded“ ir baigtų žvakių bei POC reikšmės. „GitHub“ turi įrašyti „Save NQ monitoring progress“ pakeitimą.
+3. Dar kartą paleisk tą pačią darbo eigą, šį kartą išjungęs abi bandymo parinktis. Pirmas rinkos patikrinimas sukurs atskirą `state/` pažangos failą kiekvienam intervalui.
+4. Žurnale turi būti abiejų intervalų patikrinimai ir jų baigtų žvakių bei POC reikšmės. „First run: baseline recorded“ rodomas tik pirmą kartą pradėtam intervalui. „GitHub“ turi įrašyti „Save NQ monitoring progress“ pakeitimą. Vieno intervalo duomenų ar siuntimo klaida netrukdo pabandyti patikrinti kitą intervalą; bendras vykdymas vis tiek pažymimas nesėkmingas, kad sutrikimas būtų matomas.
 5. Po to grafikas vykdomas automatiškai 12, 27, 42 ir 57 minutę kiekvieną valandą (UTC). Kompiuterį gali išjungti.
 6. Žalia „Actions“ būsena patvirtina vykdymą, bet ne rinkos duomenų šviežumą. Žurnale visada matysi naujausios apdorotos žvakės laiką. Uždarytoje rinkoje jis natūraliai senesnis.
 
@@ -77,11 +79,11 @@ python -m unittest discover -s tests -v
 
 `--dry-run` tik gauna duomenis ir parodo POC; nieko nesiunčia ir neišsaugo pažangos. „Gmail“ prisijungimo jam nereikia.
 
-Tikras vietinis siuntimas reikalauja aplinkos kintamųjų `GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`. Juos nustatyk savo aplinkoje. Vienas patikrinimas: `python monitor.py --once`. Bandomasis laiškas: `python monitor.py --test-email`. Atstatymas: `python monitor.py --once --reset-state` — pašalina tos konfigūracijos laukiančius signalus ir pradeda nuo naujo atskaitos taško. Vienu metu naudok vieną vykdytoją ir išsaugok `state/` tarp paleidimų.
+Tikras vietinis siuntimas reikalauja aplinkos kintamųjų `GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`. Juos nustatyk savo aplinkoje. Vienas abiejų intervalų patikrinimas: `python monitor.py --once`. Bandomasis laiškas: `python monitor.py --test-email` — siunčiamas vienas testinis laiškas. Atstatymas: `python monitor.py --once --reset-state` — pašalina visų konfigūracijoje pasirinktų intervalų laukiančius signalus ir pradeda juos nuo naujo atskaitos taško. Vienu metu naudok vieną vykdytoją ir išsaugok `state/` tarp paleidimų.
 
 ## Patikros būsena
 
-Viešų NQ žvakių gavimas ir POC apskaičiavimas patikrinti vietoje. Automatiniai testai tikrina apimties paskirstymą, kirtimus, užsidarymą, pažangą ir pakartotinį siuntimą. Tikras Gmail siuntimas ir GitHub debesijos veikimas turi būti patikrinti tavo paskyrose; šiame pakete nėra prisijungimo duomenų, o debesijos stebėjimas dar neaktyvuotas.
+Automatiniai testai tikrina apimties paskirstymą, kirtimus, 15 min. ir 1H žvakių užsidarymą, atskirą pažangą, senų 15 min. būsenų suderinamumą ir pakartotinį siuntimą. Viešų žvakių gavimą patikrink su `--dry-run`, o tikrą laiškų siuntimą ir pažangos išsaugojimą — savo „GitHub Actions“ žurnaluose. Šiame pakete nėra prisijungimo duomenų.
 
 ## Oficialūs šaltiniai
 
