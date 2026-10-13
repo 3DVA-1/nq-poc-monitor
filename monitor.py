@@ -1,4 +1,4 @@
-"""Delayed NQ POC alerts, using 15-minute Yahoo Finance OHLCV and Gmail SMTP.
+"""Delayed NQ POC alerts, using native Yahoo 15-minute/hourly OHLCV and Gmail SMTP.
 
 Run once from a scheduler. The state directory must survive across runs.
 No trading/account endpoints are used. Yahoo's public chart endpoint is not
@@ -25,8 +25,20 @@ from zoneinfo import ZoneInfo
 from volume_profile import Bar, profile, crossing
 
 INTERVAL = 900
+TIMEFRAME_SECONDS = {"15m": 900, "1h": 3600}
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("nq")
+
+
+def interval_seconds(cfg):
+    timeframe = cfg.get("timeframe", "15m")
+    if timeframe not in TIMEFRAME_SECONDS:
+        raise ValueError("Unsupported candle timeframe")
+    return TIMEFRAME_SECONDS[timeframe]
+
+
+def timeframe_label(cfg):
+    return "1H" if cfg.get("timeframe", "15m") == "1h" else "15 min"
 
 
 def read_config(path):
@@ -46,6 +58,12 @@ def read_config(path):
     for key in ("alert_up", "alert_down"):
         if type(cfg.get(key)) is not bool:
             raise ValueError(f"config.json: invalid {key}")
+    timeframes = cfg.get("timeframes", ["15m"])
+    if (not isinstance(timeframes, list) or not timeframes or
+            any(not isinstance(frame, str) or frame not in TIMEFRAME_SECONDS for frame in timeframes) or
+            len(set(timeframes)) != len(timeframes)):
+        raise ValueError("config.json: timeframes must contain distinct 15m and/or 1h values")
+    cfg["timeframes"] = timeframes
     ZoneInfo(cfg["display_timezone"])
     return cfg
 
@@ -53,11 +71,15 @@ def read_config(path):
 def identity(cfg):
     relevant = {k: cfg[k] for k in ("symbol", "bars", "rows", "value_area_percent", "alert_up", "alert_down")}
     relevant["calculation_version"] = 1
+    if cfg.get("timeframe", "15m") != "15m":
+        relevant["timeframe"] = cfg["timeframe"]
     return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def fetch_chart(symbol):
-    query = urlencode({"range": "1mo", "interval": "15m", "includePrePost": "true"})
+def fetch_chart(symbol, timeframe="15m"):
+    if timeframe not in TIMEFRAME_SECONDS:
+        raise ValueError("Unsupported candle timeframe")
+    query = urlencode({"range": "1mo", "interval": timeframe, "includePrePost": "true"})
     last_error = None
     # The second hostname is a fallback for service outages, not rate limits.
     for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
@@ -79,8 +101,11 @@ def fetch_chart(symbol):
     raise RuntimeError("Yahoo chart request failed") from last_error
 
 
-def parse_candles(chart):
-    if chart.get("meta", {}).get("dataGranularity") != "15m":
+def parse_candles(chart, timeframe="15m"):
+    if timeframe not in TIMEFRAME_SECONDS:
+        raise ValueError("Unsupported candle timeframe")
+    expected = ("1h", "60m") if timeframe == "1h" else ("15m",)
+    if chart.get("meta", {}).get("dataGranularity") not in expected:
         raise ValueError("Provider returned a different candle interval")
     timestamps = chart.get("timestamp", [])
     quotes = chart.get("indicators", {}).get("quote", [])
@@ -114,7 +139,8 @@ def parse_candles(chart):
 
 def finalized(candles, cfg, now):
     cutoff = now - cfg["assumed_delay_seconds"] - cfg["finalization_buffer_seconds"]
-    return [(stamp, bar) for stamp, bar in candles if stamp + INTERVAL <= cutoff]
+    duration = interval_seconds(cfg)
+    return [(stamp, bar) for stamp, bar in candles if stamp + duration <= cutoff]
 
 
 def poc_at(candles, index, cfg):
@@ -148,6 +174,7 @@ def save_state(path, state):
 
 
 def process(candles, cfg, now, state, contract_hint=None):
+    duration = interval_seconds(cfg)
     if len(candles) < cfg["bars"] + 1:
         raise ValueError("Not enough finalized candles for current and previous POC")
     # Names are merely a best-effort contract-change hint, not a rollover guarantee.
@@ -177,7 +204,7 @@ def process(candles, cfg, now, state, contract_hint=None):
             direction = crossing(candles[index - 1][1].close, previous["poc"], candles[index][1].close, current["poc"])
             enabled = cfg["alert_up"] if direction == "up" else cfg["alert_down"]
             if direction and enabled:
-                if now - (stamp + INTERVAL) <= cfg["maximum_alert_age_seconds"]:
+                if now - (stamp + duration) <= cfg["maximum_alert_age_seconds"]:
                     event_id = f"{identity(cfg)}-{stamp}-{direction}"
                     if not any(item["id"] == event_id for item in state["pending"]):
                         state["pending"].append({"id": event_id, "bar_open": stamp,
@@ -227,11 +254,14 @@ def send_mail(subject, body, event_id):
 
 def describe_event(event, cfg, now):
     zone = ZoneInfo(cfg["display_timezone"])
-    closed = datetime.fromtimestamp(event["bar_open"] + INTERVAL, timezone.utc).astimezone(zone)
+    duration = interval_seconds(cfg)
+    label = timeframe_label(cfg)
+    closed = datetime.fromtimestamp(event["bar_open"] + duration, timezone.utc).astimezone(zone)
     direction = "Kaina virš POC" if event["direction"] == "up" else "Kaina žemiau POC"
-    age = max(0, int((now - event["bar_open"] - INTERVAL) / 60))
-    subject = f"[VĖLUOJANTYS DUOMENYS] {cfg['symbol']} 15 min — {direction}"
+    age = max(0, int((now - event["bar_open"] - duration) / 60))
+    subject = f"[VĖLUOJANTYS DUOMENYS] {cfg['symbol']} {label} — {direction}"
     body = (f"{direction}\n\nSimbolis: {cfg['symbol']} (Yahoo Finance)\n"
+            f"Žvakės intervalas: {label}\n"
             f"Žvakės užsidarymas: {closed:%Y-%m-%d %H:%M %Z} ({cfg['display_timezone']})\n"
             f"Užsidarymo kaina: {event['close']:.2f}\nPOC: {event['poc']:.4f}\n"
             f"Ankstesnis užsidarymas / POC: {event['previous_close']:.2f} / {event['previous_poc']:.4f}\n"
@@ -244,9 +274,10 @@ def describe_event(event, cfg, now):
 
 
 def deliver_pending(state, path, cfg, now, sender=send_mail):
+    duration = interval_seconds(cfg)
     while state["pending"]:
         event = state["pending"][0]
-        if now - event["bar_open"] - INTERVAL > cfg["maximum_alert_age_seconds"]:
+        if now - event["bar_open"] - duration > cfg["maximum_alert_age_seconds"]:
             LOG.warning("Expired pending signal discarded")
         else:
             subject, body = describe_event(event, cfg, now)
@@ -254,6 +285,47 @@ def deliver_pending(state, path, cfg, now, sender=send_mail):
             LOG.info("Signal accepted by SMTP server")
         state["pending"].pop(0)
         save_state(path, state)
+
+
+def run_timeframe(cfg, args):
+    timeframe = cfg.get("timeframe", "15m")
+    LOG.info("Starting %s timeframe monitoring (%s)", timeframe, timeframe_label(cfg))
+    if not args.dry_run:
+        mail_settings()  # Do not start monitoring with incomplete email setup.
+    path = Path(args.state_dir) / f"{identity(cfg)}.json"
+    state = new_state() if args.reset_state else load_state(path)
+    chart = fetch_chart(cfg["symbol"], timeframe)
+    now = time.time()
+    candles = finalized(parse_candles(chart, timeframe), cfg, now)
+    process(candles, cfg, now, state, chart.get("meta", {}).get("shortName"))
+    current = poc_at(candles, len(candles) - 1, cfg)
+    latest_time = datetime.fromtimestamp(candles[-1][0] + interval_seconds(cfg), timezone.utc).isoformat()
+    LOG.info("%s: Finalized candles: %d; latest close time UTC: %s", timeframe, len(candles), latest_time)
+    if current:
+        LOG.info("%s: Close: %.2f; POC: %.4f; VA: %.4f .. %.4f", timeframe, candles[-1][1].close,
+                 current["poc"], current["val"], current["vah"])
+    if args.dry_run:
+        LOG.info("%s: Dry run: %d pending signals; nothing sent or saved", timeframe, len(state["pending"]))
+        return
+    save_state(path, state)  # Durable per-timeframe outbox before attempting SMTP.
+    deliver_pending(state, path, cfg, now)
+
+
+def log_failure(context, exc):
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        LOG.error("%s: Gmail rejected login; check app password and 2-Step Verification", context)
+    elif isinstance(exc, smtplib.SMTPException):
+        # Record only the exception type and numeric codes, never server text or credentials.
+        code = getattr(exc, "smtp_code", None)
+        codes = {code} if isinstance(code, int) else set()
+        if isinstance(exc, smtplib.SMTPRecipientsRefused):
+            codes.update(reply[0] for reply in exc.recipients.values() if isinstance(reply[0], int))
+        LOG.error("%s: SMTP failed (%s; response codes: %s); pending signal retained for a later retry",
+                  context, type(exc).__name__, ",".join(str(code) for code in sorted(codes)) or "not provided")
+    elif isinstance(exc, (ValueError, KeyError, IndexError)):
+        LOG.error("%s: Setup or data error: %s", context, exc)
+    else:
+        LOG.error("%s: Service error (%s): %s", context, type(exc).__name__, exc)
 
 
 def main(argv=None):
@@ -274,40 +346,18 @@ def main(argv=None):
             send_mail("NQ stebėtojas — bandomasis laiškas", "Laiškų siuntimas veikia. Tai bandymas, ne rinkos signalas.", f"test-{int(time.time())}")
             LOG.info("Test email accepted by SMTP server")
             return 0
-        if not args.dry_run:
-            mail_settings()  # Do not start monitoring with incomplete email setup.
-        path = Path(args.state_dir) / f"{identity(cfg)}.json"
-        state = new_state() if args.reset_state else load_state(path)
-        chart = fetch_chart(cfg["symbol"])
-        now = time.time()
-        candles = finalized(parse_candles(chart), cfg, now)
-        process(candles, cfg, now, state, chart.get("meta", {}).get("shortName"))
-        current = poc_at(candles, len(candles) - 1, cfg)
-        latest_time = datetime.fromtimestamp(candles[-1][0] + INTERVAL, timezone.utc).isoformat()
-        LOG.info("Finalized candles: %d; latest close time UTC: %s", len(candles), latest_time)
-        if current:
-            LOG.info("Close: %.2f; POC: %.4f; VA: %.4f .. %.4f", candles[-1][1].close, current["poc"], current["val"], current["vah"])
-        if args.dry_run:
-            LOG.info("Dry run: %d pending signals; nothing sent or saved", len(state["pending"]))
-            return 0
-        save_state(path, state)  # Durable outbox before attempting SMTP.
-        deliver_pending(state, path, cfg, now)
-        return 0
-    except (ValueError, KeyError, IndexError) as exc:
-        LOG.error("Setup or data error: %s", exc)
-    except smtplib.SMTPAuthenticationError:
-        LOG.error("Gmail rejected login; check app password and 2-Step Verification")
-    except smtplib.SMTPException as exc:
-        # Record only the exception type and numeric codes, never server text or credentials.
-        code = getattr(exc, "smtp_code", None)
-        codes = {code} if isinstance(code, int) else set()
-        if isinstance(exc, smtplib.SMTPRecipientsRefused):
-            codes.update(reply[0] for reply in exc.recipients.values() if isinstance(reply[0], int))
-        LOG.error("SMTP failed (%s; response codes: %s); pending signal retained for a later retry",
-                  type(exc).__name__, ",".join(str(code) for code in sorted(codes)) or "not provided")
-    except (OSError, RuntimeError) as exc:
-        LOG.error("Service error (%s): %s", type(exc).__name__, exc)
-    return 1
+    except (ValueError, KeyError, IndexError, smtplib.SMTPException, OSError, RuntimeError) as exc:
+        log_failure("Setup/test email", exc)
+        return 1
+    failed = False
+    for timeframe in cfg["timeframes"]:
+        frame_cfg = dict(cfg, timeframe=timeframe)
+        try:
+            run_timeframe(frame_cfg, args)
+        except (ValueError, KeyError, IndexError, smtplib.SMTPException, OSError, RuntimeError) as exc:
+            log_failure(timeframe, exc)
+            failed = True
+    return int(failed)
 
 
 if __name__ == "__main__":
