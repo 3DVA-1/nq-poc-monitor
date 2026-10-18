@@ -41,6 +41,33 @@ def timeframe_label(cfg):
     return "1H" if cfg.get("timeframe", "15m") == "1h" else "15 min"
 
 
+def nq_session_open(stamp):
+    """Regular weekly CME equity-index hours; not a holiday calendar."""
+    local = datetime.fromtimestamp(stamp, timezone.utc).astimezone(ZoneInfo("America/New_York"))
+    weekday, hour = local.weekday(), local.hour
+    if weekday == 5:  # Saturday.
+        return False
+    if weekday == 6:  # Sunday evening reopening.
+        return hour >= 18
+    if weekday == 4:  # Friday weekly shutdown.
+        return hour < 17
+    return hour < 17 or hour >= 18  # Daily 17:00-18:00 maintenance.
+
+
+def valid_bar_timestamp(stamp, timeframe="15m", symbol="NQ=F"):
+    """Accept complete grid intervals, applying NQ's regular weekly session."""
+    if timeframe not in TIMEFRAME_SECONDS:
+        raise ValueError("Unsupported candle timeframe")
+    duration = TIMEFRAME_SECONDS[timeframe]
+    if type(stamp) is not int or stamp % duration:
+        return False
+    if symbol != "NQ=F":
+        return True
+    # The close itself may be exactly 17:00; every instant in [open, close)
+    # must belong to the regular session. Supported bars are at most one hour.
+    return nq_session_open(stamp) and nq_session_open(stamp + duration - 1)
+
+
 def read_config(path):
     cfg = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(cfg.get("symbol"), str) or not cfg["symbol"]:
@@ -101,7 +128,7 @@ def fetch_chart(symbol, timeframe="15m"):
     raise RuntimeError("Yahoo chart request failed") from last_error
 
 
-def parse_candles(chart, timeframe="15m"):
+def parse_candles(chart, timeframe="15m", symbol="NQ=F"):
     if timeframe not in TIMEFRAME_SECONDS:
         raise ValueError("Unsupported candle timeframe")
     expected = ("1h", "60m") if timeframe == "1h" else ("15m",)
@@ -121,6 +148,8 @@ def parse_candles(chart, timeframe="15m"):
         if type(stamp) is not int or stamp in seen:
             raise ValueError("Invalid or duplicate candle timestamp")
         seen.add(stamp)
+        if not valid_bar_timestamp(stamp, timeframe, symbol):
+            continue  # Quote snapshots and closed-session filler are not candles.
         values = [q[field][i] for field in fields]
         if all(value is None for value in values):
             continue  # Provider's explicit no-trading row.
@@ -140,7 +169,9 @@ def parse_candles(chart, timeframe="15m"):
 def finalized(candles, cfg, now):
     cutoff = now - cfg["assumed_delay_seconds"] - cfg["finalization_buffer_seconds"]
     duration = interval_seconds(cfg)
-    return [(stamp, bar) for stamp, bar in candles if stamp + duration <= cutoff]
+    return [(stamp, bar) for stamp, bar in candles
+            if valid_bar_timestamp(stamp, cfg.get("timeframe", "15m"), cfg.get("symbol", "NQ=F"))
+            and stamp + duration <= cutoff]
 
 
 def poc_at(candles, index, cfg):
@@ -173,10 +204,41 @@ def save_state(path, state):
     os.replace(temporary, path)
 
 
+def repair_invalid_checkpoint(candles, cfg, state):
+    """Rebaseline only a proven invalid NQ checkpoint, preserving real outbox events."""
+    saved = state["last_bar"]
+    if cfg.get("symbol", "NQ=F") != "NQ=F" or saved is None:
+        return False
+    if type(saved) is not int:
+        raise ValueError("Invalid state checkpoint timestamp")
+    timeframe = cfg.get("timeframe", "15m")
+    if valid_bar_timestamp(saved, timeframe, "NQ=F"):
+        return False
+    if (len(candles) < cfg["bars"] + 1 or
+            any(not valid_bar_timestamp(stamp, timeframe, "NQ=F") for stamp, _ in candles) or
+            poc_at(candles, len(candles) - 1, cfg) is None or
+            poc_at(candles, len(candles) - 2, cfg) is None):
+        raise ValueError("Cannot repair invalid checkpoint without valid finalized profile history")
+    original_pending = state["pending"]
+    genuine_pending = [event for event in original_pending
+                       if valid_bar_timestamp(event.get("bar_open"), timeframe, "NQ=F")]
+    state["last_bar"] = candles[-1][0]
+    state["pending"] = genuine_pending
+    LOG.warning("%s: Repaired invalid NQ checkpoint %s to %s; historical alerts suppressed; "
+                "retained %d genuine pending signals; discarded %d invalid-timestamp signals",
+                timeframe, saved, state["last_bar"], len(genuine_pending),
+                len(original_pending) - len(genuine_pending))
+    return True
+
+
 def process(candles, cfg, now, state, contract_hint=None):
     duration = interval_seconds(cfg)
     if len(candles) < cfg["bars"] + 1:
         raise ValueError("Not enough finalized candles for current and previous POC")
+    if repair_invalid_checkpoint(candles, cfg, state):
+        if contract_hint:
+            state["contract_hint"] = contract_hint
+        return
     # Names are merely a best-effort contract-change hint, not a rollover guarantee.
     if contract_hint and state.get("contract_hint") and contract_hint != state["contract_hint"]:
         LOG.warning("Contract description changed; resetting signal baseline")
@@ -296,7 +358,7 @@ def run_timeframe(cfg, args):
     state = new_state() if args.reset_state else load_state(path)
     chart = fetch_chart(cfg["symbol"], timeframe)
     now = time.time()
-    candles = finalized(parse_candles(chart, timeframe), cfg, now)
+    candles = finalized(parse_candles(chart, timeframe, cfg["symbol"]), cfg, now)
     process(candles, cfg, now, state, chart.get("meta", {}).get("shortName"))
     current = poc_at(candles, len(candles) - 1, cfg)
     latest_time = datetime.fromtimestamp(candles[-1][0] + interval_seconds(cfg), timezone.utc).isoformat()
