@@ -4,6 +4,8 @@ Programa gauna vėluojančias NQ **15 min. ir 1H** žvakes iš „Yahoo Finance�
 
 `config.json` laukelis `"timeframes": ["15m", "1h"]` įjungia abu intervalus. Galima palikti tik vieną iš jų. Senesnė konfigūracija be šio laukelio stebi tik 15 min. grafiką.
 
+`"notification_repeats": 3` nustato **tris atskirus to paties naujo signalo laiškus iš eilės**, pažymėtus `1/3`, `2/3` ir `3/3`. Kiekvienas turi atskirą laiško identifikatorių. Telefono garsų ar pranešimų skaičių vis tiek valdo „Gmail“ ir telefono nustatymai. Galimos reikšmės 1–3; jei laukelio nėra, siunčiamas vienas laiškas. Pakartojimų skaičius užfiksuojamas sukuriant signalą: senesni laukiantys signalai be šio nustatymo tebesiunčiami po vieną, o stebėjimo pažanga nenustatoma iš naujo.
+
 ## Kada ateina laiškas
 
 - Į viršų: ankstesnis užsidarymas buvo ties ankstesniu POC arba žemiau; naujas užsidarymas yra virš naujo POC.
@@ -16,6 +18,7 @@ Programa gauna vėluojančias NQ **15 min. ir 1H** žvakes iš „Yahoo Finance�
 - Jei ankstesnė programos versija įsiminė netinkamo laiko `NQ=F` eilutę, turint pakankamai tinkamų užsidariusių žvakių atkuriamas atskaitos taškas ties naujausia iš jų. Taisymo metu istoriniai signalai nesiunčiami; tinkamų žvakių laukiantys laiškai išlaikomi, o aiškiai netinkamo laiko įvykiai atmetami. Įprastas tinkamo laiko atskaitos taškas dėl senesnio tiekėjo atsakymo nenustatomas iš naujo — toks atsakymas tebėra klaida.
 - Po sutrikimo aptinkami neperskaityti signalai, bet senesni nei 90 min. nebesiunčiami.
 - SMTP klaidos atveju signalas išsaugomas ir bandomas vėliau. Pakartotinis siuntimas vykdomas, kai pavyksta ir rinkos duomenų užklausa; ilgas duomenų sutrikimas gali atidėti laišką iki jo galiojimo pabaigos. Po neaiškaus ryšio nutrūkimo retai galimas pakartotinis laiškas, nes SMTP negali užtikrinti vienintelio pristatymo.
+- Po kiekvieno „Gmail“ priimto numeruoto laiško išsaugomas išsiųstų kopijų skaičius. Jei antras arba trečias siuntimas nepavyksta, kitą kartą tęsiama nuo likusių kopijų. 90 min. galiojimo riba taikoma ir likusiems pakartojimams; trijų laiškų siuntimas nelaukia kito suplanuoto patikrinimo.
 
 ## Paleidimas debesijoje: tavo kompiuterio nereikės
 
@@ -51,7 +54,7 @@ Jeigu `ALERT_EMAIL` nepateiksi, laiškai siunčiami į `GMAIL_USER`.
 Pasirenkamas duomenų patikrinimas prieš įrašant „Gmail“ programos slaptažodį: „Actions → NQ POC el. pastas → Run workflow“ pažymėk **Patikrinti duomenis be laisku ir be pazangos issaugojimo**. Šis bandymas gauna NQ žvakes ir parodo POC, nereikalauja „Gmail“ prisijungimo, nesiunčia laiškų ir neišsaugo pažangos. Jei pažymėtos abi bandymo parinktys, pirmenybė teikiama duomenų patikrinimui ir laiškas nesiunčiamas. Tikram stebėjimui šią parinktį išjunk.
 
 1. „Actions“ pasirink **NQ POC el. pastas → Run workflow**.
-2. Pažymėk **Siusti tik bandomaji laiska** ir paleisk. Patikrink Gmail, įskaitant šlamšto aplanką. Tai tik bandomasis laiškas.
+2. Pažymėk **Siusti tik bandomaji laiska** ir paleisk. Patikrink Gmail, įskaitant šlamšto aplanką. Bandymas siunčia nustatytą kopijų skaičių — su `notification_repeats: 3` gausi tris aiškiai pažymėtus bandomuosius laiškus. Tai nėra rinkos signalai; stebėjimo pažanga nekeičiama.
 3. Dar kartą paleisk tą pačią darbo eigą, šį kartą išjungęs abi bandymo parinktis. Pirmas rinkos patikrinimas sukurs atskirą `state/` pažangos failą kiekvienam intervalui.
 4. Žurnale turi būti abiejų intervalų patikrinimai ir jų baigtų žvakių bei POC reikšmės. „First run: baseline recorded“ rodomas tik pirmą kartą pradėtam intervalui. „GitHub“ turi įrašyti „Save NQ monitoring progress“ pakeitimą. Vieno intervalo duomenų ar siuntimo klaida netrukdo pabandyti patikrinti kitą intervalą; bendras vykdymas vis tiek pažymimas nesėkmingas, kad sutrikimas būtų matomas.
 5. Po to grafikas vykdomas automatiškai 12, 27, 42 ir 57 minutę kiekvieną valandą (UTC). Kompiuterį gali išjungti.
@@ -81,7 +84,7 @@ python -m unittest discover -s tests -v
 
 `--dry-run` tik gauna duomenis ir parodo POC; nieko nesiunčia ir neišsaugo pažangos. „Gmail“ prisijungimo jam nereikia.
 
-Tikras vietinis siuntimas reikalauja aplinkos kintamųjų `GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`. Juos nustatyk savo aplinkoje. Vienas abiejų intervalų patikrinimas: `python monitor.py --once`. Bandomasis laiškas: `python monitor.py --test-email` — siunčiamas vienas testinis laiškas. Atstatymas: `python monitor.py --once --reset-state` — pašalina visų konfigūracijoje pasirinktų intervalų laukiančius signalus ir pradeda juos nuo naujo atskaitos taško. Vienu metu naudok vieną vykdytoją ir išsaugok `state/` tarp paleidimų.
+Tikras vietinis siuntimas reikalauja aplinkos kintamųjų `GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`. Juos nustatyk savo aplinkoje. Vienas abiejų intervalų patikrinimas: `python monitor.py --once`. Bandomieji laiškai: `python monitor.py --test-email` — siunčiamas konfigūracijoje pasirinktas kopijų skaičius. Atstatymas: `python monitor.py --once --reset-state` — pašalina visų konfigūracijoje pasirinktų intervalų laukiančius signalus ir pradeda juos nuo naujo atskaitos taško. Vienu metu naudok vieną vykdytoją ir išsaugok `state/` tarp paleidimų.
 
 ## Patikros būsena
 
