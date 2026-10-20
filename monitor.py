@@ -68,6 +68,13 @@ def valid_bar_timestamp(stamp, timeframe="15m", symbol="NQ=F"):
     return nq_session_open(stamp) and nq_session_open(stamp + duration - 1)
 
 
+def notification_count(cfg):
+    count = cfg.get("notification_repeats", 1)
+    if type(count) is not int or not 1 <= count <= 3:
+        raise ValueError("config.json: notification_repeats must be an integer from 1 to 3")
+    return count
+
+
 def read_config(path):
     cfg = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(cfg.get("symbol"), str) or not cfg["symbol"]:
@@ -91,6 +98,7 @@ def read_config(path):
             len(set(timeframes)) != len(timeframes)):
         raise ValueError("config.json: timeframes must contain distinct 15m and/or 1h values")
     cfg["timeframes"] = timeframes
+    cfg["notification_repeats"] = notification_count(cfg)
     ZoneInfo(cfg["display_timezone"])
     return cfg
 
@@ -274,7 +282,9 @@ def process(candles, cfg, now, state, contract_hint=None):
                                                  "close": candles[index][1].close,
                                                  "poc": current["poc"],
                                                  "previous_close": candles[index - 1][1].close,
-                                                 "previous_poc": previous["poc"]})
+                                                 "previous_poc": previous["poc"],
+                                                 "notifications_total": notification_count(cfg),
+                                                 "notifications_sent": 0})
                         LOG.info("Queued delayed POC signal: %s", direction)
                 else:
                     LOG.info("Old recovery signal skipped")
@@ -335,6 +345,15 @@ def describe_event(event, cfg, now):
     return subject, body
 
 
+def notification_payload(subject, body, event_id, number, total):
+    """Give each repeated copy stable identity while retaining legacy single emails."""
+    if total == 1:
+        return subject, body, event_id
+    return (f"[{number}/{total}] {subject}",
+            f"Pranešimas {number}/{total} apie tą patį signalą.\n\n{body}",
+            f"{event_id}-notification-{number}")
+
+
 def deliver_pending(state, path, cfg, now, sender=send_mail):
     duration = interval_seconds(cfg)
     while state["pending"]:
@@ -342,9 +361,22 @@ def deliver_pending(state, path, cfg, now, sender=send_mail):
         if now - event["bar_open"] - duration > cfg["maximum_alert_age_seconds"]:
             LOG.warning("Expired pending signal discarded")
         else:
+            # Pending events written before repeats existed must remain one email,
+            # regardless of the current configuration. New events snapshot the count.
+            total = event.get("notifications_total", 1)
+            sent = event.get("notifications_sent", 0)
+            if (type(total) is not int or not 1 <= total <= 3 or
+                    type(sent) is not int or not 0 <= sent <= total):
+                raise ValueError("Invalid pending notification progress")
             subject, body = describe_event(event, cfg, now)
-            sender(subject, body, event["id"])
-            LOG.info("Signal accepted by SMTP server")
+            while sent < total:
+                number = sent + 1
+                sender(*notification_payload(subject, body, event["id"], number, total))
+                event["notifications_total"] = total
+                event["notifications_sent"] = number
+                save_state(path, state)  # Each accepted copy is durable before the next.
+                sent = number
+                LOG.info("Signal accepted by SMTP server (%d/%d)", sent, total)
         state["pending"].pop(0)
         save_state(path, state)
 
@@ -405,8 +437,13 @@ def main(argv=None):
         if args.test_email:
             if args.dry_run:
                 raise ValueError("Do not combine --test-email with --dry-run")
-            send_mail("NQ stebėtojas — bandomasis laiškas", "Laiškų siuntimas veikia. Tai bandymas, ne rinkos signalas.", f"test-{int(time.time())}")
-            LOG.info("Test email accepted by SMTP server")
+            total = notification_count(cfg)
+            event_id = f"test-{time.time_ns()}"
+            subject = "[TESTAS] NQ stebėtojas — bandomasis laiškas"
+            body = "Laiškų siuntimas veikia. TESTAS: tai bandymas, ne rinkos signalas."
+            for number in range(1, total + 1):
+                send_mail(*notification_payload(subject, body, event_id, number, total))
+                LOG.info("Test email accepted by SMTP server (%d/%d)", number, total)
             return 0
     except (ValueError, KeyError, IndexError, smtplib.SMTPException, OSError, RuntimeError) as exc:
         log_failure("Setup/test email", exc)
