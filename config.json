@@ -1,6 +1,7 @@
 {
   "symbol": "NQ=F",
   "timeframes": ["15m", "1h"],
+  "notification_repeats": 3,
   "bars": 150,
   "rows": 24,
   "value_area_percent": 70,
