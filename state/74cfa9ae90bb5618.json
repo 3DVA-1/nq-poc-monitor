@@ -1,18 +1,7 @@
 {
   "contract_hint": "Nasdaq 100 Dec 26",
-  "last_bar": 1792975500,
+  "last_bar": 1792978200,
   "pending": [
-    {
-      "bar_open": 1792972800,
-      "close": 29202.0,
-      "direction": "up",
-      "id": "74cfa9ae90bb5618-1792972800-up",
-      "notifications_sent": 0,
-      "notifications_total": 3,
-      "poc": 29126.276041666664,
-      "previous_close": 29140.75,
-      "previous_poc": 29151.598958333336
-    },
     {
       "bar_open": 1792975500,
       "close": 29097.25,
@@ -22,6 +11,28 @@
       "notifications_total": 3,
       "poc": 29126.276041666664,
       "previous_close": 29135.75,
+      "previous_poc": 29126.276041666664
+    },
+    {
+      "bar_open": 1792977300,
+      "close": 29143.0,
+      "direction": "up",
+      "id": "74cfa9ae90bb5618-1792977300-up",
+      "notifications_sent": 0,
+      "notifications_total": 3,
+      "poc": 29126.276041666664,
+      "previous_close": 29060.0,
+      "previous_poc": 29126.276041666664
+    },
+    {
+      "bar_open": 1792978200,
+      "close": 29063.25,
+      "direction": "down",
+      "id": "74cfa9ae90bb5618-1792978200-down",
+      "notifications_sent": 0,
+      "notifications_total": 3,
+      "poc": 29126.276041666664,
+      "previous_close": 29143.0,
       "previous_poc": 29126.276041666664
     }
   ],
