@@ -311,17 +311,33 @@ def send_mail(subject, body, event_id):
     msg["Date"] = formatdate(localtime=False)
     msg["Message-ID"] = f"<nq-{event_id}@nq-monitor.local>"
     msg.set_content(body)
-    LOG.info("Connecting to Gmail SMTP using STARTTLS")
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
-        smtp.ehlo()
-        smtp.starttls(context=ssl.create_default_context())
-        smtp.ehlo()
-        LOG.info("Gmail TLS established; authenticating")
-        smtp.login(username, password)
-        LOG.info("Gmail authenticated; submitting email")
-        refused = smtp.send_message(msg)
-        if refused:
-            raise RuntimeError("SMTP recipient rejected")
+    for use_ssl in (False, True):
+        port = 465 if use_ssl else 587
+        submission_started = False
+        try:
+            LOG.info("Connecting to Gmail SMTP %d using %s", port, "TLS" if use_ssl else "STARTTLS")
+            connection = (smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=30,
+                                          context=ssl.create_default_context()) if use_ssl else
+                          smtplib.SMTP("smtp.gmail.com", port, timeout=30))
+            with connection as smtp:
+                smtp.ehlo()
+                if not use_ssl:
+                    smtp.starttls(context=ssl.create_default_context())
+                    smtp.ehlo()
+                LOG.info("Gmail SMTP %d TLS established; authenticating", port)
+                smtp.login(username, password)
+                LOG.info("Gmail SMTP %d authenticated; submitting email", port)
+                # A disconnect during submission can leave delivery uncertain.
+                # Only switch transports before any email has been submitted.
+                submission_started = True
+                refused = smtp.send_message(msg)
+                if refused:
+                    raise RuntimeError("SMTP recipient rejected")
+            return
+        except smtplib.SMTPServerDisconnected:
+            if use_ssl or submission_started:
+                raise
+            LOG.warning("Gmail SMTP 587 disconnected before email submission; trying encrypted SMTP 465 once")
 
 
 def describe_event(event, cfg, now):
