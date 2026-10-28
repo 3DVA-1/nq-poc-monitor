@@ -1,18 +1,6 @@
 {
   "contract_hint": "Nasdaq 100 Dec 26",
-  "last_bar": 1793138400,
-  "pending": [
-    {
-      "bar_open": 1793138400,
-      "close": 29820.0,
-      "direction": "up",
-      "id": "a4bd3ed3f251e0b6-1793138400-up",
-      "notifications_sent": 0,
-      "notifications_total": 3,
-      "poc": 29808.041666666664,
-      "previous_close": 29803.0,
-      "previous_poc": 29808.041666666664
-    }
-  ],
+  "last_bar": 1793142000,
+  "pending": [],
   "version": 1
 }
