@@ -1,8 +1,7 @@
 name: NQ POC el. pastas
 
 on:
-  schedule:
-    - cron: '12,27,42,57 * * * *'
+ 
   workflow_dispatch:
     inputs:
       dry_run:
